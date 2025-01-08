@@ -1,8 +1,8 @@
-use std::usize;
+use std::{collections::HashSet, usize};
 
 use regex::Regex;
 use reqwest::Error;
-use sqlx::pool::PoolOptions;
+use sqlx::{pool::PoolOptions, postgres::PgPoolOptions, Acquire};
 use url::Url;
 
 async fn get_page(url: &String) -> Result<String, Error> {
@@ -13,18 +13,45 @@ async fn get_page(url: &String) -> Result<String, Error> {
 #[tokio::main]
 async fn main() {
     let mut urls: Vec<String> = ["https://wikipedia.org".to_string()].to_vec();
+    let db_url = "postgres://rust_user:password@localhost/rust_db";
+    let mut visited_urls = HashSet::new();
     for _ in 0..=10 {
         let size = urls.len();
+        for i in 0..size {
+            let url = &urls[i];
+            if visited_urls.contains(url) {
+                continue;
+            }
 
-        for i in 0..=size {
+            visited_urls.insert(url.clone());
+
             let size = urls.len();
-            let content = get_page(&urls[i as usize])
-                .await
-                .expect("failed to reached url");
-            urls.extend(extract_links(&content, &urls[i as usize]).await);
-            println!("{i} links: {size}, {urls:?}")
+            println!("{size}");
+            match get_page(url).await {
+                Ok(content) => {
+                    let new_links = extract_links(&content, url).await;
+                    urls.extend(new_links);
+                }
+                Err(e) => {
+                    eprintln!("Error trying to get {} : {}", url, e);
+                }
+            }
         }
     }
+
+    let pages: Vec<Page> = urls
+        .iter()
+        .enumerate()
+        .map(|(id, url)| Page {
+            id: (id + 1) as u32,
+            url: url.clone(),
+        })
+        .collect();
+    if let Err(e) = manage_db(db_url, &pages).await {
+        eprintln!("Error while insering data into db : {}", e);
+    }
+
+    println!("finish");
 }
 
 async fn extract_links(content: &String, url: &String) -> Vec<String> {
@@ -66,19 +93,38 @@ async fn extract_links(content: &String, url: &String) -> Vec<String> {
     liens_externes.into_iter().collect()
 }
 
-struct pages {
+struct Page {
     id: u32,
     url: String,
-    keywords: Vec<String>,
 }
 
-async fn manage_db(
-    db_url: &str,
-    urls: &Vec<String>,
-    keywords: &Vec<Vec<String>>,
-) -> Result<(), sqlx::Error> {
+async fn manage_db(db_url: &str, pages: &[Page]) -> Result<(), sqlx::Error> {
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(db_url)
         .await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS websites(
+            id SERIAL PRIMARY KEY,
+            url TEXT NOT NULL UNIQUE
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+    let mut transaction = pool.begin().await?;
+    let insert_query = r#"
+        INSERT INTO websites (url)
+        VALUES ($1)
+        ON CONFLICT (url) DO NOTHING
+    "#;
+    for page in pages {
+        sqlx::query(insert_query)
+            .bind(&page.url)
+            .execute(&mut *transaction)
+            .await?;
+    }
+    transaction.commit().await?;
+    Ok(())
 }
